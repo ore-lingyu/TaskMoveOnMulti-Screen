@@ -1,0 +1,328 @@
+    move-to-other-display-animation
+
+diff --git a/core/java/android/view/SurfaceControl.java b/core/java/android/view/SurfaceControl.java
+index a1ce39e974e3..ed08b545d333 100644
+--- a/core/java/android/view/SurfaceControl.java
++++ b/core/java/android/view/SurfaceControl.java
+@@ -106,6 +106,11 @@ public final class SurfaceControl implements Parcelable {
+     private static native void nativeWriteToParcel(long nativeObject, Parcel out);
+     private static native void nativeRelease(long nativeObject);
+     private static native void nativeDisconnect(long nativeObject);
++    /**
++     * @hide
++     */
++    public static native int nativeGetActiveBufferWidth(long nativeObject);
++
+     private static native void nativeUpdateDefaultBufferSize(long nativeObject, int width, int height);
+     private static native int nativeCaptureDisplay(DisplayCaptureArgs captureArgs,
+             ScreenCaptureListener captureListener);
+diff --git a/core/jni/android_view_SurfaceControl.cpp b/core/jni/android_view_SurfaceControl.cpp
+index f388fec2cd78..4ff6ffc6695e 100644
+--- a/core/jni/android_view_SurfaceControl.cpp
++++ b/core/jni/android_view_SurfaceControl.cpp
+@@ -455,7 +455,13 @@ static void nativeSetDefaultBufferSize(JNIEnv* env, jclass clazz, jlong nativeOb
+         ctrl->updateDefaultBufferSize(width, height);
+     }
+ }
+-
++static int nativeGetActiveBufferWidth(JNIEnv* env, jclass clazz, jlong nativeObject) { //目的就是为了获取surfaceflinger层面的buffer宽度，因为windowstate的宽高存在短暂的和surfaceflinger的layer不一致情况，需要以surfaceflinger为最后依据
++    SurfaceControl* const ctrl = reinterpret_cast<SurfaceControl *>(nativeObject);
++    if (ctrl != NULL) {
++        return ctrl->getActiveBufferWidth();
++    }
++    return 0;
++}
+ static Rect rectFromObj(JNIEnv* env, jobject rectObj) {
+     int left = env->GetIntField(rectObj, gRectClassInfo.left);
+     int top = env->GetIntField(rectObj, gRectClassInfo.top);
+@@ -2087,6 +2093,8 @@ static const JNINativeMethod sSurfaceControlMethods[] = {
+             (void*)nativeRelease },
+     {"nativeDisconnect", "(J)V",
+             (void*)nativeDisconnect },
++    {"nativeGetActiveBufferWidth", "(J)I",
++                        (void*)nativeGetActiveBufferWidth },
+     {"nativeUpdateDefaultBufferSize", "(JII)V",
+             (void*)nativeSetDefaultBufferSize},
+     {"nativeCreateTransaction", "()J",
+diff --git a/services/core/java/com/android/server/wm/DisplayContent.java b/services/core/java/com/android/server/wm/DisplayContent.java
+index 695c300b51fd..24c1e9c018db 100644
+--- a/services/core/java/com/android/server/wm/DisplayContent.java
++++ b/services/core/java/com/android/server/wm/DisplayContent.java
+@@ -105,6 +105,7 @@ import static com.android.server.policy.WindowManagerPolicy.FINISH_LAYOUT_REDO_L
+ import static com.android.server.policy.WindowManagerPolicy.FINISH_LAYOUT_REDO_WALLPAPER;
+ import static com.android.server.wm.ActivityRecord.State.RESUMED;
+ import static com.android.server.wm.ActivityTaskManagerService.POWER_MODE_REASON_CHANGE_DISPLAY;
++import static com.android.server.wm.ActivityTaskSupervisor.PRESERVE_WINDOWS;
+ import static com.android.server.wm.DisplayContentProto.APP_TRANSITION;
+ import static com.android.server.wm.DisplayContentProto.CLOSING_APPS;
+ import static com.android.server.wm.DisplayContentProto.CURRENT_FOCUS;
+@@ -157,6 +158,9 @@ import static com.android.server.wm.WindowStateAnimator.READY_TO_SHOW;
+ import static com.android.server.wm.utils.RegionUtils.forEachRectReverse;
+ import static com.android.server.wm.utils.RegionUtils.rectListToRegion;
+ 
++import android.animation.Animator;
++import android.animation.AnimatorListenerAdapter;
++import android.animation.ValueAnimator;
+ import android.annotation.IntDef;
+ import android.annotation.NonNull;
+ import android.annotation.Nullable;
+@@ -169,6 +173,7 @@ import android.content.res.CompatibilityInfo;
+ import android.content.res.Configuration;
+ import android.graphics.Bitmap;
+ import android.graphics.ColorSpace;
++import android.graphics.GraphicBuffer;
+ import android.graphics.Matrix;
+ import android.graphics.Point;
+ import android.graphics.Rect;
+@@ -225,8 +230,10 @@ import android.view.WindowInsets;
+ import android.view.WindowManager;
+ import android.view.WindowManager.DisplayImePolicy;
+ import android.view.WindowManagerPolicyConstants.PointerEventListener;
++import android.view.animation.AccelerateInterpolator;
+ import android.window.DisplayWindowPolicyController;
+ import android.window.IDisplayAreaOrganizer;
++import android.window.TaskSnapshot;
+ import android.window.TransitionRequestInfo;
+ 
+ import com.android.internal.annotations.VisibleForTesting;
+@@ -734,13 +741,137 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+             }
+         }
+     };
++
++    HardwareBuffer getTaskShot(int taskId) {//获取Task的截图，这个主要是为了在屏幕大小不一样的情况下多屏互动，因为屏幕大小变化，activity的要relauncher，相关画面
++    //也需要重新删除创建，会有短暂啥也不显示情况。屏幕大小如果一样不需要调用
++        TaskSnapshot taskSnapshot = mWmService.mAtmService.takeTaskSnapshot(taskId);
++
++        return taskSnapshot.getHardwareBuffer();
++    }
+ //add by doublescreenmove
++    SurfaceControl copyTaskSc = null;
++    SurfaceControl copyTaskBuffer = null;
++    SurfaceControl mTaskScreenShot = null;
++    SurfaceControl realWindowStateBuffer = null;
++    DisplayContent mOtherDisplayContent = null;
++    int mCurrentRootTaskId = -1;
++    boolean mDiffScreenSize = false;
++    public void startAutoMove(int startX,boolean right) {//松手后自动滑动部分实现
++        int endX =0;
++        if (right) {
++            endX = getDisplay().getWidth();
++        }
++        SurfaceControl.Transaction t =mWmService.mTransactionFactory.get();
++        ValueAnimator valueAnimator = ValueAnimator.ofInt(startX,endX);//这里就是方案设计中讲的offsetX ---> width或者offsetX ----> 0
++        valueAnimator.addUpdateListener(
++                animation -> {
++                    android.util.Log.i("DoubleScreen"," animation.getAnimatedValue() = " + animation.getAnimatedValue());
++                    int moveX = (int)animation.getAnimatedValue();
++                    startMoveCurrentScreenTask(moveX,0);
++                });
++        valueAnimator.setInterpolator(new AccelerateInterpolator(1.0f));
++        valueAnimator.addListener(new AnimatorListenerAdapter() {
++
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                super.onAnimationEnd(animation);
++                if (right) {
++                    resetState();//对动画播放完成需要进行ActivityRecord状态回置
++                } else { //针对拖动不够太多回到原来
++                    mRootWindowContainer.moveRootTaskToDisplay(mCurrentRootTaskId,mDisplayId,true);
++                    mCurrentRootTaskId = -1;
++                    float[] mTmpFloats = new float[9];
++                    Matrix outMatrix = new Matrix();
++
++                    if (realWindowStateBuffer != null) {
++                        outMatrix.reset();
++                        t.setMatrix(realWindowStateBuffer,outMatrix,mTmpFloats);
++                    }
++
++                }
++                if (copyTaskSc!= null && copyTaskBuffer!= null) { //动画播放完成则需要把新创建图层进行删除
++                    t.remove(copyTaskBuffer);
++                    t.remove(copyTaskSc);
++                    t.apply();
++                    copyTaskSc = null;
++                    copyTaskBuffer = null;
++                }
++
++            }
++        });
++        valueAnimator.setDuration(500);
++        valueAnimator.start();
++
++    }
++    public void startMoveCurrentScreenTask(int x,int y) { //这个是对外触摸的接口
++        if (copyTaskBuffer!= null) {//真正调用这个moveCurrentScreenTask相关业务操作
++            moveCurrentScreenTask(mWmService.mTransactionFactory.get(),copyTaskBuffer,x,y);
++        }
++    }
++    void moveCurrentScreenTask(SurfaceControl.Transaction t,SurfaceControl surfaceControl,int x,int y) {
++        // t.setPosition(surfaceControl, x, y);
++        float[] mTmpFloats = new float[9];
++        Matrix outMatrix = new Matrix();
++        float scaleX = ((float) getDisplayInfo().logicalWidth/ (float) mOtherDisplayContent.getDisplayInfo().logicalWidth);//主要是考虑到大小不同屏幕互动情况，大小一样那就都是1
++        float scaleY = ((float) getDisplayInfo().logicalHeight / (float) mOtherDisplayContent.getDisplayInfo().logicalHeight);
++
++        ActivityRecord activityRecord = mOtherDisplayContent.getTopRootTask().getTopActivity(false,false);
++        int activeBufferWidth = 0;
++        if (activityRecord.getTopChild() != null && activityRecord.getTopChild().mWinAnimator.getSurfaceControl()!= null ) { //获取layer层面真实的宽度
++            android.util.Log.i("DoubleScreen","activityRecord.getTopChild() active buffer width =" + SurfaceControl.nativeGetActiveBufferWidth(activityRecord.getTopChild().mWinAnimator.getSurfaceControl().mNativeObject));
++            activeBufferWidth = SurfaceControl.nativeGetActiveBufferWidth(activityRecord.getTopChild().mWinAnimator.getSurfaceControl().mNativeObject);
++        }
++        if (realWindowStateBuffer != null) {
++            outMatrix.reset(); 
++	     //对屏幕2的新task进行坐标平移操作，对屏幕大小一样的则直接就是在个偏移-（width - offsetX） = offsetX - width，屏幕大小不一样则需要进行对应scale操作
++            if ((mDiffScreenSize && mCurrentRootTaskId == mOtherDisplayContent.getTopRootTask().mTaskId && activityRecord.getTopChild() != null &&
++                    activeBufferWidth == mOtherDisplayContent.getDisplayInfo().logicalWidth) || !mDiffScreenSize) {
++                outMatrix.postTranslate(x / scaleX - mOtherDisplayContent.getDisplayInfo().logicalWidth, y);
++            } else { //针对屏幕大小不一样，则一定要等到surfaceflinger的layer宽度和屏幕2宽度一样才可以，不然只能一直显示再屏幕外面
++                outMatrix.postTranslate( - getDisplayInfo().logicalWidth, y);
++            }
++
++            t.show(realWindowStateBuffer);
++            t.setMatrix(realWindowStateBuffer,outMatrix,mTmpFloats);//给对应的task图层设置对应的matrix
++        }
++        outMatrix.reset();
++        if (mDiffScreenSize && mCurrentRootTaskId == mOtherDisplayContent.getTopRootTask().mTaskId  && activeBufferWidth == mOtherDisplayContent.getDisplayInfo().logicalWidth)//针对屏幕大小不一样情况，需要判断layer宽度确实已经变化过来了才可以进行scale，不然会屏幕1基础scale就异常了
++            outMatrix.postScale(scaleX,scaleY);
++        float offsetXMainDisplay =x+ (getDisplayInfo().logicalWidth - x );//这个部分属于屏幕1镜像图层偏移坐标，这里为啥会是这样，不是应该只要x这个偏移就行么？
++        //这里其实就和前面说的镜像图层实际挂了task，task再屏幕2进行了坐标改变，当然也会影响屏幕1的镜像图层效果，所以(getDisplayInfo().logicalWidth - x )是为了消除屏幕2 task的坐标偏移带来的影响，最后屏幕1上的镜像图层偏移量就只是x
++        outMatrix.postTranslate(offsetXMainDisplay, y);
++        android.util.Log.i("DoubleScreen","moveCurrentScreenTask scaleX =" +scaleX+ " scaleY " + scaleY +" offsetX = "+x
++                + " mTmpFloats " + mTmpFloats+ " outMatrix " + outMatrix);
++        t.setMatrix(surfaceControl,outMatrix,mTmpFloats);
++        t.show(copyTaskBuffer);
++        if (mDiffScreenSize && mTaskScreenShot != null) {
++            outMatrix.reset();
++            outMatrix.postTranslate(x, y);
++            t.setMatrix(mTaskScreenShot,outMatrix,mTmpFloats);
++        }
++        t.apply();
++    }
++    ActivityRecord mCurrentRecord = null;
++    void ensureOtherDisplayActivityVisible(DisplayContent other) {//注意这个方法很关键，这里会让activity底下的activity也跟着显示出来，即2个activity同时显示不然拖动task时候底部只能黑屏体验很差
++        ActivityRecord otherTopActivity = other.getTopActivity(false,false);
++        if (otherTopActivity != null) {
++            android.util.Log.i("test33","ensureOtherDisplayActivityVisible otherTopActivity = " + otherTopActivity);
++            otherTopActivity.mLaunchTaskBehind = true;
++            mCurrentRecord = otherTopActivity;
++        }
++    }
++    void resetState() { //恢复正常状态，让mLaunchTaskBehind变成false
++        if (mCurrentRecord != null) {
++            mCurrentRecord.mLaunchTaskBehind =  false;
++            mRootWindowContainer.ensureActivitiesVisible(null, 0, PRESERVE_WINDOWS);
++        }
++    }
+     public void doTestMoveTaskToOtherDisplay() {
+         DisplayContent otherDisplay = null;
+         if (mRootWindowContainer.getChildCount() == 2) {
+             otherDisplay = (mRootWindowContainer.getChildAt(0) == this) ? mRootWindowContainer.getChildAt(1):mRootWindowContainer.getChildAt(0);
+         }
+         if (otherDisplay!= this && otherDisplay!= null) {
++            mDiffScreenSize = getDisplayInfo().logicalWidth != otherDisplay.getDisplayInfo().logicalWidth;
++            mOtherDisplayContent = otherDisplay;
+             int rootTaskId = 0;
+             try {
+                 Task rootTask = getTopRootTask();
+@@ -749,7 +880,42 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+                     return;
+                 }
+                 rootTaskId =rootTask.mTaskId;
++                WindowState windowState = rootTask.getTopActivity(false,false).getTopChild();//获取task的顶部WindowState
++                android.util.Log.i("DoubleScreen","doTestMoveTaskToOtherDisplay getTopActivity" + rootTask.getTopActivity(false,false) +" windowState " + windowState);
++                if (windowState!= null) {
++                    final SurfaceControl.Transaction t = mWmService.mTransactionFactory.get();
++
++                    if (copyTaskSc == null) { //创建一个rootTaskCopy图层主要用来放置镜像Task画面
++                        copyTaskSc =  makeChildSurface(null)
++                                .setName("rootTaskCopy")
++                                .setParent(getWindowingLayer())
++                                .build();
++                    }
++                    if (copyTaskBuffer == null) {
++                        if (mDiffScreenSize) {//fix a bug of diff size screen may make activity recreate
++                            mTaskScreenShot =  makeChildSurface(null) //主要为了前面说的屏幕大小不一样情况，为了规避可能出现activity relauncher会有闪黑问题
++                                    .setName("copyTaskBuffer")
++                                    .setOpaque(true)
++                                    .setCallsite("copyTaskBuffer")
++                                    .setBLASTLayer()
++                                    .build();
++                            t.reparent(mTaskScreenShot,copyTaskSc);
++                            t.setBuffer(mTaskScreenShot,getTaskShot(rootTaskId));
++                            t.show(mTaskScreenShot);
++                        }
++                        copyTaskBuffer = SurfaceControl.mirrorSurface(rootTask.getSurfaceControl());
++                    }
++                    realWindowStateBuffer = rootTask.getSurfaceControl();
++                    t.reparent(copyTaskBuffer,copyTaskSc);
++                    t.show(copyTaskSc);
++                    t.show(copyTaskBuffer);
++                    t.apply();
++                }
++                ensureOtherDisplayActivityVisible(otherDisplay);
++                mCurrentRootTaskId = rootTaskId;
++                startMoveCurrentScreenTask(0,0);//这里再启动前需要调用一下startMoveCurrentScreenTask，目的是为了把屏幕2的Task坐标移动到屏幕外，不然可能会产生开始拖拉时候，屏幕2会有显示一瞬间的task画面，有个闪烁，这里就早早把偏移设置好
+                 mRootWindowContainer.moveRootTaskToDisplay(rootTaskId,otherDisplay.mDisplayId,true);
++                android.util.Log.i("DoubleScreen","doTestMoveTaskToOtherDisplay end time");
+             }catch (Exception e) {
+                 android.util.Log.i("DoubleScreen","doTestMoveTaskToOtherDisplay Exception",e);
+             }
+diff --git a/services/core/java/com/android/server/wm/DoubleScreenMovePointerEventListener.java b/services/core/java/com/android/server/wm/DoubleScreenMovePointerEventListener.java
+index f9c765476d19..c2ebf007515a 100644
+--- a/services/core/java/com/android/server/wm/DoubleScreenMovePointerEventListener.java
++++ b/services/core/java/com/android/server/wm/DoubleScreenMovePointerEventListener.java
+@@ -10,7 +10,8 @@ public class DoubleScreenMovePointerEventListener implements WindowManagerPolicy
+ 
+     int mPoint0LastX = 0;
+     int mPoint1LastX = 0;
+-    int START_GAP = 20;
++    int START_GAP = 6;
++    int AUTO_MOVE_GAP = 100;
+     private final WindowManagerService mService;
+ 
+     public DoubleScreenMovePointerEventListener(WindowManagerService mService, DisplayContent mDisplayContent) {
+@@ -27,6 +28,10 @@ public class DoubleScreenMovePointerEventListener implements WindowManagerPolicy
+             case MotionEvent.ACTION_DOWN:
+             case MotionEvent.ACTION_POINTER_DOWN:
+                 if (motionEvent.getPointerCount() > 2) {
++                    int detaX = mPoint0LastX - mPoint0FirstX;
++                    if (shouldBeginMove && detaX > AUTO_MOVE_GAP) {
++                        mDisplayContent.startAutoMove(detaX,detaX > AUTO_MOVE_GAP);
++                    }
+                     shouldBeginMove = false;
+                     android.util.Log.i("DoubleScreen","DoubleScreenMovePointerEventListener motionEvent.getPointerCount() > 2 end DoubleScreenMove ");
+                 }
+@@ -39,8 +44,9 @@ public class DoubleScreenMovePointerEventListener implements WindowManagerPolicy
+                 break;
+            case MotionEvent.ACTION_MOVE:
+                if (motionEvent.getPointerCount() == 2) {
+-                   if (!shouldBeginMove && motionEvent.getX(0)  - mPoint0FirstX > START_GAP &&
+-                           motionEvent.getX(1)  - mPoint1FirstX > START_GAP) {
++                   android.util.Log.i("DoubleScreen", " mPoint0FirstX "+mPoint0FirstX+" mPoint1FirstX "+mPoint1FirstX +" motionEvent.getX(0)  " +motionEvent.getX(0) + " motionEvent.getX(1) " + motionEvent.getX(1));
++                   if (!shouldBeginMove && (motionEvent.getX(0)  - mPoint0FirstX > START_GAP ||
++                           motionEvent.getX(1)  - mPoint1FirstX > START_GAP)) {
+                        android.util.Log.i("DoubleScreen","DoubleScreenMovePointerEventListener start DoubleScreenMove ");
+                        shouldBeginMove = true;
+                        mDisplayContent.doTestMoveTaskToOtherDisplay();
+@@ -48,10 +54,20 @@ public class DoubleScreenMovePointerEventListener implements WindowManagerPolicy
+ 
+                    mPoint0LastX = (int)motionEvent.getX(0);
+                    mPoint1LastX = (int)motionEvent.getX(1);
++                   if (shouldBeginMove) {
++                        int detaX = mPoint0LastX - mPoint0FirstX;
++                        mDisplayContent.startMoveCurrentScreenTask(detaX,0);
++                   }
+                }
+                break;
+            case MotionEvent.ACTION_POINTER_UP:
+            case MotionEvent.ACTION_UP:
++           case MotionEvent.ACTION_CANCEL:
++               if (shouldBeginMove) {
++                   int detaX = mPoint0LastX - mPoint0FirstX;
++                   mDisplayContent.startAutoMove(detaX,detaX > AUTO_MOVE_GAP);
++
++               }
+                shouldBeginMove = false;
+                mPoint0FirstX = mPoint1FirstX =0;
+                android.util.Log.i("DoubleScreen","DoubleScreenMovePointerEventListener ACTION_UP end DoubleScreenMove ");

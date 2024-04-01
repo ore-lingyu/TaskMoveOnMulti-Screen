@@ -1,0 +1,158 @@
+    simple doublescreen move task to other
+
+diff --git a/services/core/java/com/android/server/wm/DisplayContent.java b/services/core/java/com/android/server/wm/DisplayContent.java
+index a03dce364209..695c300b51fd 100644
+--- a/services/core/java/com/android/server/wm/DisplayContent.java
++++ b/services/core/java/com/android/server/wm/DisplayContent.java
+@@ -484,6 +484,7 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+     /** Detect user tapping outside of current focused task bounds .*/
+     @VisibleForTesting
+     final TaskTapPointerEventListener mTapDetector;
++    final DoubleScreenMovePointerEventListener mDoubleScreenMoveListener;
+ 
+     /** Detect user tapping outside of current focused root task bounds .*/
+     private Region mTouchExcludeRegion = new Region();
+@@ -733,7 +734,28 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+             }
+         }
+     };
+-
++//add by doublescreenmove
++    public void doTestMoveTaskToOtherDisplay() {
++        DisplayContent otherDisplay = null;
++        if (mRootWindowContainer.getChildCount() == 2) {
++            otherDisplay = (mRootWindowContainer.getChildAt(0) == this) ? mRootWindowContainer.getChildAt(1):mRootWindowContainer.getChildAt(0);
++        }
++        if (otherDisplay!= this && otherDisplay!= null) {
++            int rootTaskId = 0;
++            try {
++                Task rootTask = getTopRootTask();
++                if (rootTask.isActivityTypeHome()) {
++                    android.util.Log.i("DoubleScreen","doTestMoveTaskToOtherDisplay isActivityTypeHome");
++                    return;
++                }
++                rootTaskId =rootTask.mTaskId;
++                mRootWindowContainer.moveRootTaskToDisplay(rootTaskId,otherDisplay.mDisplayId,true);
++            }catch (Exception e) {
++                android.util.Log.i("DoubleScreen","doTestMoveTaskToOtherDisplay Exception",e);
++            }
++        }
++    }
++ //end  by doublescreenmove
+     private final ToBooleanFunction<WindowState> mFindFocusedWindow = w -> {
+         final ActivityRecord focusedApp = mFocusedApp;
+         ProtoLog.v(WM_DEBUG_FOCUS, "Looking for focus: %s, flags=%d, canReceive=%b, reason=%s",
+@@ -1063,7 +1085,9 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+         // 1. All physical displays (multi-display).
+         // 2. VirtualDisplays on VR, AA (and everything else).
+         mTapDetector = new TaskTapPointerEventListener(mWmService, this);
++        mDoubleScreenMoveListener = new DoubleScreenMovePointerEventListener(mWmService, this);
+         registerPointerEventListener(mTapDetector);
++        registerPointerEventListener(mDoubleScreenMoveListener);
+         registerPointerEventListener(mWmService.mMousePositionTracker);
+         if (mWmService.mAtmService.getRecentTasks() != null) {
+             registerPointerEventListener(
+@@ -3580,7 +3604,7 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+ 
+     WindowState findFocusedWindow() {
+         mTmpWindow = null;
+-
++        android.util.Log.i("WindowManager","findFocusedWindow",new Exception());
+         forAllWindows(mFindFocusedWindow, true /* traverseTopToBottom */);
+ 
+         if (mTmpWindow == null) {
+@@ -5032,7 +5056,9 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+         if (child == null) {
+             return b;
+         }
+-
++       // if (child.getName()!= null && child.getName().contains("DefaultTask")) {
++            android.util.Log.i("test1","mSurfaceControl = " +mSurfaceControl + " child.getName() " + child.getName());
++       // }
+         return b.setName(child.getName())
+                 .setParent(mSurfaceControl);
+     }
+@@ -5312,6 +5338,7 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+ 
+     void executeAppTransition() {
+         mTransitionController.setReady(this);
++        android.util.Log.i("WindowManager","executeAppTransition mAppTransition = " +mAppTransition,new Exception());
+         if (mAppTransition.isTransitionSet()) {
+             ProtoLog.w(WM_DEBUG_APP_TRANSITIONS,
+                     "Execute app transition: %s, displayId: %d Callers=%s",
+@@ -5913,6 +5940,7 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
+         final Configuration currOverrideConfig = getRequestedOverrideConfiguration();
+         final int currRotation = currOverrideConfig.windowConfiguration.getRotation();
+         final int overrideRotation = overrideConfiguration.windowConfiguration.getRotation();
++        android.util.Log.i("WindowManager","onRequestedOverrideConfigurationChanged currOverrideConfig "+currOverrideConfig + "\n overrideConfiguration = "+overrideConfiguration);
+         if (currRotation != ROTATION_UNDEFINED && overrideRotation != ROTATION_UNDEFINED
+                 && currRotation != overrideRotation) {
+             applyRotationAndFinishFixedRotation(currRotation, overrideRotation);
+diff --git a/services/core/java/com/android/server/wm/DoubleScreenMovePointerEventListener.java b/services/core/java/com/android/server/wm/DoubleScreenMovePointerEventListener.java
+new file mode 100644
+index 000000000000..f9c765476d19
+--- /dev/null
++++ b/services/core/java/com/android/server/wm/DoubleScreenMovePointerEventListener.java
+@@ -0,0 +1,62 @@
++package com.android.server.wm;
++
++import android.view.MotionEvent;
++import android.view.WindowManagerPolicyConstants;
++
++public class DoubleScreenMovePointerEventListener implements WindowManagerPolicyConstants.PointerEventListener {
++    boolean shouldBeginMove = false;
++    int mPoint0FirstX = 0;
++    int mPoint1FirstX = 0;
++
++    int mPoint0LastX = 0;
++    int mPoint1LastX = 0;
++    int START_GAP = 20;
++    private final WindowManagerService mService;
++
++    public DoubleScreenMovePointerEventListener(WindowManagerService mService, DisplayContent mDisplayContent) {
++        this.mService = mService;
++        this.mDisplayContent = mDisplayContent;
++    }
++
++    private final DisplayContent mDisplayContent;
++
++    @Override
++    public void onPointerEvent(MotionEvent motionEvent) {
++        android.util.Log.i("DoubleScreenTouch","DoubleScreenMovePointerEventListener onPointerEvent motionEvent = "+motionEvent);
++        switch (motionEvent.getActionMasked()) {
++            case MotionEvent.ACTION_DOWN:
++            case MotionEvent.ACTION_POINTER_DOWN:
++                if (motionEvent.getPointerCount() > 2) {
++                    shouldBeginMove = false;
++                    android.util.Log.i("DoubleScreen","DoubleScreenMovePointerEventListener motionEvent.getPointerCount() > 2 end DoubleScreenMove ");
++                }
++                if (motionEvent.getPointerCount() == 2) {
++                    if (mPoint0FirstX == 0 && mPoint1FirstX == 0) {
++                        mPoint0FirstX = (int)motionEvent.getX(0);
++                        mPoint1FirstX = (int)motionEvent.getX(1);
++                    }
++                }
++                break;
++           case MotionEvent.ACTION_MOVE:
++               if (motionEvent.getPointerCount() == 2) {
++                   if (!shouldBeginMove && motionEvent.getX(0)  - mPoint0FirstX > START_GAP &&
++                           motionEvent.getX(1)  - mPoint1FirstX > START_GAP) {
++                       android.util.Log.i("DoubleScreen","DoubleScreenMovePointerEventListener start DoubleScreenMove ");
++                       shouldBeginMove = true;
++                       mDisplayContent.doTestMoveTaskToOtherDisplay();
++                   }
++
++                   mPoint0LastX = (int)motionEvent.getX(0);
++                   mPoint1LastX = (int)motionEvent.getX(1);
++               }
++               break;
++           case MotionEvent.ACTION_POINTER_UP:
++           case MotionEvent.ACTION_UP:
++               shouldBeginMove = false;
++               mPoint0FirstX = mPoint1FirstX =0;
++               android.util.Log.i("DoubleScreen","DoubleScreenMovePointerEventListener ACTION_UP end DoubleScreenMove ");
++               break;
++       }
++    }
++
++}

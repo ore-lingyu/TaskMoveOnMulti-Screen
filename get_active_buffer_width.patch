@@ -1,0 +1,166 @@
+    add interface for getActiveBufferWidth
+
+diff --git a/libs/gui/ISurfaceComposerClient.cpp b/libs/gui/ISurfaceComposerClient.cpp
+index 5e7a7ec67b..30e26fa035 100644
+--- a/libs/gui/ISurfaceComposerClient.cpp
++++ b/libs/gui/ISurfaceComposerClient.cpp
+@@ -34,6 +34,7 @@ enum class Tag : uint32_t {
+     CREATE_WITH_SURFACE_PARENT,
+     CLEAR_LAYER_FRAME_STATS,
+     GET_LAYER_FRAME_STATS,
++    GET_ACTIVE_BUFFER_WIDTH,
+     MIRROR_SURFACE,
+     LAST = MIRROR_SURFACE,
+ };
+@@ -58,6 +59,9 @@ public:
+                                                                             handle, gbp, outLayerId,
+                                                                             outTransformHint);
+     }
++    int getActiveBufferWidth(const sp<IBinder>& handle) {
++         return callRemote<decltype(&ISurfaceComposerClient::getActiveBufferWidth)>(Tag::GET_ACTIVE_BUFFER_WIDTH,handle);
++    }
+ 
+     status_t createWithSurfaceParent(const String8& name, uint32_t width, uint32_t height,
+                                      PixelFormat format, uint32_t flags,
+@@ -116,6 +120,8 @@ status_t BnSurfaceComposerClient::onTransact(uint32_t code, const Parcel& data,
+             return callLocal(data, reply, &ISurfaceComposerClient::clearLayerFrameStats);
+         case Tag::GET_LAYER_FRAME_STATS:
+             return callLocal(data, reply, &ISurfaceComposerClient::getLayerFrameStats);
++        case Tag::GET_ACTIVE_BUFFER_WIDTH:
++            return callLocal(data, reply, &ISurfaceComposerClient::getActiveBufferWidth);
+         case Tag::MIRROR_SURFACE:
+             return callLocal(data, reply, &ISurfaceComposerClient::mirrorSurface);
+     }
+diff --git a/libs/gui/SurfaceComposerClient.cpp b/libs/gui/SurfaceComposerClient.cpp
+index 47d801a78d..7dc34fc1d6 100644
+--- a/libs/gui/SurfaceComposerClient.cpp
++++ b/libs/gui/SurfaceComposerClient.cpp
+@@ -2068,6 +2068,10 @@ sp<SurfaceControl> SurfaceComposerClient::createSurface(const String8& name, uin
+     return s;
+ }
+ 
++int SurfaceComposerClient::getActiveBufferWidth(const sp<IBinder>& token) {
++   return  mClient->getActiveBufferWidth(token);
++}
++
+ sp<SurfaceControl> SurfaceComposerClient::createWithSurfaceParent(const String8& name, uint32_t w,
+                                                                   uint32_t h, PixelFormat format,
+                                                                   uint32_t flags, Surface* parent,
+diff --git a/libs/gui/SurfaceControl.cpp b/libs/gui/SurfaceControl.cpp
+index 654fb336fe..395f0fbc41 100644
+--- a/libs/gui/SurfaceControl.cpp
++++ b/libs/gui/SurfaceControl.cpp
+@@ -293,6 +293,12 @@ uint64_t SurfaceControl::resolveFrameNumber(const std::optional<uint64_t>& frame
+         return mFallbackFrameNumber++;
+     }
+ }
++int SurfaceControl::getActiveBufferWidth() {
++    int width = mClient->getActiveBufferWidth(mHandle);
+ 
++     ALOGE("getActiveBufferWidth handle (%p) or client (%p) width = %d",
++                mHandle.get(), mClient.get(),width);
++    return width;
++}
+ // ----------------------------------------------------------------------------
+ }; // namespace android
+diff --git a/libs/gui/include/gui/ISurfaceComposerClient.h b/libs/gui/include/gui/ISurfaceComposerClient.h
+index 9e9e191480..b6d29f98e8 100644
+--- a/libs/gui/include/gui/ISurfaceComposerClient.h
++++ b/libs/gui/include/gui/ISurfaceComposerClient.h
+@@ -81,7 +81,7 @@ public:
+      * Requires ACCESS_SURFACE_FLINGER permission
+      */
+     virtual status_t getLayerFrameStats(const sp<IBinder>& handle, FrameStats* outStats) const = 0;
+-
++    virtual int  getActiveBufferWidth(const sp<IBinder>& handle) = 0;
+     virtual status_t mirrorSurface(const sp<IBinder>& mirrorFromHandle, sp<IBinder>* outHandle,
+                                    int32_t* outLayerId) = 0;
+ };
+diff --git a/libs/gui/include/gui/SurfaceComposerClient.h b/libs/gui/include/gui/SurfaceComposerClient.h
+index efbdb36fef..9332448f42 100644
+--- a/libs/gui/include/gui/SurfaceComposerClient.h
++++ b/libs/gui/include/gui/SurfaceComposerClient.h
+@@ -305,7 +305,7 @@ public:
+     // surface creation / destruction
+ 
+     static sp<SurfaceComposerClient> getDefault();
+-
++    int getActiveBufferWidth(const sp<IBinder>& token);
+     //! Create a surface
+     sp<SurfaceControl> createSurface(const String8& name, // name of the surface
+                                      uint32_t w,          // width in pixel
+diff --git a/libs/gui/include/gui/SurfaceControl.h b/libs/gui/include/gui/SurfaceControl.h
+index b72cf8390e..641e80d442 100644
+--- a/libs/gui/include/gui/SurfaceControl.h
++++ b/libs/gui/include/gui/SurfaceControl.h
+@@ -100,7 +100,7 @@ public:
+     sp<SurfaceControl> getParentingLayer();
+ 
+     uint64_t resolveFrameNumber(const std::optional<uint64_t>& frameNumber);
+-
++    int getActiveBufferWidth();
+ private:
+     // can't be copied
+     SurfaceControl& operator = (SurfaceControl& rhs);
+diff --git a/services/inputflinger/dispatcher/InputDispatcher.cpp b/services/inputflinger/dispatcher/InputDispatcher.cpp
+index 5e9427ad87..01d6f5e575 100644
+--- a/services/inputflinger/dispatcher/InputDispatcher.cpp
++++ b/services/inputflinger/dispatcher/InputDispatcher.cpp
+@@ -4309,6 +4309,7 @@ InputEventInjectionResult InputDispatcher::injectInputEvent(const InputEvent* ev
+                                                        motionEvent.getTransform());
+                 injectedEntries.push(std::move(nextInjectedEntry));
+             }
++            ALOGW("injectInputEvent  injectedEntry->displayId motionEvent displayId %d",motionEvent.getDisplayId());
+             break;
+         }
+ 
+diff --git a/services/surfaceflinger/Client.cpp b/services/surfaceflinger/Client.cpp
+index 6d7b732b36..185db3d098 100644
+--- a/services/surfaceflinger/Client.cpp
++++ b/services/surfaceflinger/Client.cpp
+@@ -119,6 +119,12 @@ status_t Client::getLayerFrameStats(const sp<IBinder>& handle, FrameStats* outSt
+     layer->getFrameStats(outStats);
+     return NO_ERROR;
+ }
+-
++int Client::getActiveBufferWidth(const sp<IBinder>& handle) {
++      sp<Layer> layer = getLayerUser(handle);
++    if (layer == nullptr) {
++        return -1;
++    }
++    return (int)(layer->getBounds().right -  layer->getBounds().left);
++}
+ // ---------------------------------------------------------------------------
+ }; // namespace android
+diff --git a/services/surfaceflinger/Client.h b/services/surfaceflinger/Client.h
+index 15cd763822..9e34d245ca 100644
+--- a/services/surfaceflinger/Client.h
++++ b/services/surfaceflinger/Client.h
+@@ -63,6 +63,7 @@ private:
+     status_t mirrorSurface(const sp<IBinder>& mirrorFromHandle, sp<IBinder>* handle,
+                            int32_t* outLayerId);
+ 
++    virtual int getActiveBufferWidth(const sp<IBinder>& handle);
+     virtual status_t clearLayerFrameStats(const sp<IBinder>& handle) const;
+ 
+     virtual status_t getLayerFrameStats(const sp<IBinder>& handle, FrameStats* outStats) const;
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 6a17cd8881..2c54df5c32 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3234,6 +3234,7 @@ void SurfaceFlinger::updateInputFlinger() {
+                                                       inputFlinger = mInputFlinger, this]() {
+         ATRACE_NAME("BackgroundExecutor::updateInputFlinger");
+         if (updateWindowInfo) {
++            ALOGE("windowInfosChanged windowInfos %d ",(int)windowInfos.size());
+             mWindowInfosListenerInvoker->windowInfosChanged(windowInfos, displayInfos,
+                                                             inputWindowCommands.syncInputWindows);
+         } else if (inputWindowCommands.syncInputWindows) {
+@@ -3241,6 +3242,7 @@ void SurfaceFlinger::updateInputFlinger() {
+             // changes to input windows, notify immediately.
+             windowInfosReported();
+         }
++         ALOGE("inputWindowCommands.focusRequests %d ",(int)inputWindowCommands.focusRequests.size());
+         for (const auto& focusRequest : inputWindowCommands.focusRequests) {
+             inputFlinger->setFocusedWindow(focusRequest);
+         }
